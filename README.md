@@ -43,6 +43,34 @@ The model is named after the training CSV, so name it after the car fingerprint:
 
 (`nnlc-interventions` needs 100 Hz rows; with `--stride`, overrides are already removed by the extractor.)
 
+### Hand-driven data (`nnlc-torque-target`)
+
+Trained on the steering command of openpilot-steered frames only, the model learns the controller that was running
+when the data was recorded, including its friction setting. twilsonco's first NNLC models were trained on hand-driven
+data instead, where the driver supplies the friction torque. `nnlc-torque-target` adds those frames:
+
+- The extractor now records the EPS motor torque (`steering_torque_eps`) and computes the lateral accel from the
+  steering angle with the vehicle model (carParams + liveParameters) for every frame, the same number the torque
+  controller logs (`actual_lateral_accel_ctrl`, which is 0 while the controller isn't steering). `--filter-overrides`
+  only drops openpilot-steered frames.
+- Target for both kinds of frame: `k * (EPS torque + c * driver torque)`. `k` (EPS units to command units) comes from
+  steered hands-off frames, `c` (driver torque to EPS units) from hand-driven steady curves, matched to the torque
+  openpilot needed in the same speed / lateral accel bin. `--driver-scale 0` is twilsonco's EPS-only target.
+- Hand-driven = lateral control off and no torque command, at 5 m/s or more. Lateral-only modes (openpilot steering
+  while not engaged) count as openpilot-steered.
+- It prints the friction each kind of frame shows near straight (torque per lateral jerk), so you can see what the hand
+  data adds before training. The trainer uses `torque_target` and keeps the hand-driven rows when the column is there.
+
+Re-extract (the old CSV has no EPS torque), then:
+
+```bash
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-prune-routes /app/output/lateral_data.csv \
+    -o /app/output/pruned.csv
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-torque-target /app/output/pruned.csv \
+    -o /app/output/TOYOTA_PRIUS_V.csv
+docker compose -f docker/docker-compose.yml run --rm train julia training/latmodel_temporal.jl /app/output/TOYOTA_PRIUS_V.csv
+```
+
 GPU: current NVIDIA drivers are for CUDA 13, which CUDA.jl 5.x refuses ("only supports NVIDIA drivers for CUDA 11.x
 or 12.x"), so the image installs CUDA.jl 6 (the build fails if something holds it back). Check before a long run:
 

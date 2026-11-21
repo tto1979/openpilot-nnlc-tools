@@ -50,7 +50,29 @@ COLUMNS = [
     "torque_applied",  # carOutput torque: what the car got after the safety limits (falls back to torque_output)
     "lat_active",      # lateral control actually steering
     "segment",         # route--segment, keeps temporal columns from spilling across segments
+    "steering_torque_eps",        # EPS motor torque: the assist when the driver steers, ~the command when engaged
+    "actual_lateral_accel_ctrl",  # what the lateral controller logged (0 while it is not active)
 ]
+
+ACCELERATION_DUE_TO_GRAVITY = 9.81
+
+
+def vm_lateral_accel(angle_deg, angle_offset_deg, v_ego, roll, steer_ratio, stiffness_factor, cp):
+    """Lateral accel from the steering angle, exactly as openpilot's torque controller measures it:
+    -VehicleModel.calc_curvature(radians(angle - offset), v, roll) * v^2 (opendbc vehicle_model.py).
+    The controller only logs it while it is steering; this gives the same number for hand-driven frames too.
+    cp = (mass, wheelbase, center_to_front, steer_ratio_rear, tire_stiffness_front, tire_stiffness_rear)."""
+    mass, wheelbase, center_to_front, steer_ratio_rear, c_front, c_rear = cp
+    sr = np.maximum(steer_ratio, 0.1)
+    sf = np.maximum(stiffness_factor, 0.1)
+    a_rear = wheelbase - center_to_front
+    cf, cr = sf * c_front, sf * c_rear
+    slip = mass * (cf * center_to_front - cr * a_rear) / (wheelbase ** 2 * cf * cr)
+    curvature_factor = (1.0 - steer_ratio_rear) / (1.0 - slip * v_ego ** 2) / wheelbase
+    with np.errstate(divide="ignore", invalid="ignore"):
+        roll_comp = np.where(np.abs(slip) < 1e-6, 0.0, ACCELERATION_DUE_TO_GRAVITY * roll / ((1.0 / slip) - v_ego ** 2))
+    curvature = curvature_factor * np.radians(angle_deg - angle_offset_deg) / sr + roll_comp
+    return -curvature * v_ego ** 2
 
 # openpilot route--segment names: new style 00000016--6b14df1c14--29, old style 2024-01-15--12-30-45--5
 SEGMENT_RE = re.compile(r"(?:[0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})--\d+")
@@ -83,6 +105,8 @@ def extract_segment(rlog_path):
     from nnlc_tools.logreader import LogReader
 
     rows = []
+    vm_inputs = []  # per row: steering angle, angle offset, v, roll, steer ratio, stiffness factor
+    car_params = None
     sm = {}
     segment = segment_name(rlog_path)
 
@@ -111,6 +135,10 @@ def extract_segment(rlog_path):
                 sm["modelV2"] = msg.modelV2
             elif msg_type == "carOutput":
                 sm["carOutput"] = msg.carOutput
+            elif msg_type == "carParams" and car_params is None:
+                cp = msg.carParams
+                car_params = (cp.mass, cp.wheelbase, cp.centerToFront, cp.steerRatioRear,
+                              cp.tireStiffnessFront, cp.tireStiffnessRear)
 
             # Emit a row on each controlsState when we have carState too
             if msg_type == "controlsState" and "carState" in sm:
@@ -154,6 +182,11 @@ def extract_segment(rlog_path):
                     active = getattr(ctrl, "active", getattr(ctrl, "activeDEPRECATED", False))
 
                 roll = sm["liveParameters"].roll if "liveParameters" in sm else float("nan")
+                if "liveParameters" in sm:
+                    lp = sm["liveParameters"]
+                    vm_in = (cs.steeringAngleDeg, lp.angleOffsetDeg, cs.vEgo, lp.roll, lp.steerRatio, lp.stiffnessFactor)
+                else:
+                    vm_in = (float("nan"),) * 6
 
                 lane_change_state = 0
                 if "modelV2" in sm:
@@ -184,10 +217,29 @@ def extract_segment(rlog_path):
                     torque_applied,
                     lat_active,
                     segment,
+                    cs.steeringTorqueEps,
+                    actual_lat_accel,
                 ]
                 rows.append(row)
+                vm_inputs.append(vm_in)  # kept in step with rows
     except Exception as e:
         print(f"  WARNING: Error processing {rlog_path}: {e}")
+
+    # Lateral accel for every frame from the vehicle model (carParams is logged once or twice per segment, so this runs
+    # after the whole segment is read). Without carParams, frames the controller wasn't steering get no lateral accel.
+    i_lat, i_active = COLUMNS.index("actual_lateral_accel"), COLUMNS.index("lat_active")
+    if rows and car_params is not None:
+        angle, offset, v, roll, sr, stiff = np.array(vm_inputs, dtype=np.float64).T
+        lat = vm_lateral_accel(angle, offset, v, roll, sr, stiff, car_params)
+        for row, value in zip(rows, lat):
+            if np.isfinite(value):
+                row[i_lat] = float(value)
+            elif not row[i_active]:  # no liveParameters yet: keep what the controller logged, if it was steering
+                row[i_lat] = float("nan")
+    else:
+        for row in rows:
+            if not row[i_active]:
+                row[i_lat] = float("nan")
 
     return rows
 
@@ -229,12 +281,15 @@ def process_file(rlog_path, temporal=False, filter_overrides=False, override_mar
         df = add_temporal_columns(df)
     dropped = 0
     if filter_overrides and "steering_pressed" in df.columns:
-        pressed = df["steering_pressed"].astype(bool).to_numpy().astype(np.int32)
+        # Only frames openpilot was steering: there hand torque means the command isn't what moved the wheel. Frames the
+        # driver steers alone are kept (nnlc-torque-target uses them with the EPS and driver torque).
+        engaged = df["lat_active"].astype(bool).to_numpy()
+        pressed = (df["steering_pressed"].astype(bool).to_numpy() & engaged).astype(np.int32)
         w = int(round(override_margin / 0.01))
         if w > 0:  # also drop the frames around the override (e.g. the Toyota EPS backs off around hand torque)
             # "full" + centre slice keeps the segment's length even when it is shorter than the window
             pressed = np.convolve(pressed, np.ones(2 * w + 1, dtype=np.int32), mode="full")[w:w + len(pressed)]
-        near = pressed > 0
+        near = (pressed > 0) & engaged
         dropped = int(near.sum())
         df = df[~near]
     if stride > 1:
@@ -254,7 +309,8 @@ def main():
     parser.add_argument("--temporal", action="store_true",
                         help="Add temporal lag/lead columns for NNLC training")
     parser.add_argument("--filter-overrides", action="store_true",
-                        help="Drop rows where driver overrides (steering_pressed=True)")
+                        help="Drop engaged rows where the driver overrides (steering_pressed=True); "
+                             "hand-driven rows are kept")
     parser.add_argument("--override-margin", type=float, default=0.0,
                         help="With --filter-overrides, also drop rows within this many seconds of an override")
     parser.add_argument("--stride", type=int, default=1,

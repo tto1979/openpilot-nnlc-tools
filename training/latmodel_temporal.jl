@@ -128,8 +128,17 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
     # Remove rows with missing data
     data = data[completecases(data), :]
 
+    # nnlc-torque-target output: openpilot-steered and hand-driven rows, already selected, with a torque target built
+    # from the EPS and driver torque. Keep its hand-driven rows (no engagement filters) and train on that target.
+    has_target = "torque_target" in names(data)
+    if has_target
+      n_steered = count(==(1), data[!, :source])
+      n_hand = count(==(0), data[!, :source])
+      println(out_streams, f"Torque target from nnlc-torque-target: {n_steered} openpilot-steered rows, {n_hand} hand-driven rows")
+    end
+
     # Filter out inactive and standstill rows (extractor outputs all rows)
-    if "active" in names(data)
+    if !has_target && "active" in names(data)
       old_nrows = nrow(data)
       data = filter(row -> row.active == true, data)
       println(out_streams, f"Filtered out {old_nrows - nrow(data)} inactive rows")
@@ -139,7 +148,7 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
       data = filter(row -> row.standstill == false, data)
       println(out_streams, f"Filtered out {old_nrows - nrow(data)} standstill rows")
     end
-    if "lat_active" in names(data)
+    if !has_target && "lat_active" in names(data)
       old_nrows = nrow(data)
       data = filter(row -> row.lat_active == true, data)
       println(out_streams, f"Filtered out {old_nrows - nrow(data)} rows with lateral control inactive")
@@ -148,7 +157,7 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
     # Target torque. torqueState.output and carOutput torque carry the actuators.torque sign (left positive), while
     # the lateral accels are right positive and openpilot/sunnypilot add the NN output to a torque with the sign of
     # the lateral accel. Train on the torque the car actually got (after the safety limits), with that sign.
-    target_col = "torque_applied" in names(data) ? :torque_applied : :torque_output
+    target_col = has_target ? :torque_target : ("torque_applied" in names(data) ? :torque_applied : :torque_output)
     data[!, :torque_output] = -1f0 .* Float32.(data[!, target_col])
     println(out_streams, "Target torque: -$(target_col)")
     # Select only columns needed for training (extractor outputs many extra columns)

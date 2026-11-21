@@ -28,6 +28,7 @@ nnlc-score = "nnlc_tools.score_routes:main"
 nnlc-visualize = "nnlc_tools.visualize_coverage:main"
 nnlc-validate = "nnlc_tools.visualize_model:main"
 nnlc-prune-routes = "nnlc_tools.prune_routes:main"
+nnlc-torque-target = "nnlc_tools.torque_target:main"
 nnlc-interventions = "nnlc_tools.analyze_interventions:main"
 nnlc-sc-visualize = "nnlc_tools.steering_classifier.visualize:main"
 

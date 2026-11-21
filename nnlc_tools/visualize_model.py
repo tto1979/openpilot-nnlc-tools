@@ -267,7 +267,8 @@ def main():
     print(f"Loaded {len(df)} data rows")
     # The model outputs torque with the sign of the lateral accel (what openpilot/sunnypilot expect); logged torques
     # carry the actuators.torque sign. Compare like with like, using the torque the car actually got when logged.
-    src = "torque_applied" if "torque_applied" in df.columns else "torque_output"
+    # A file from nnlc-torque-target carries the target the model was trained on (EPS and driver torque).
+    src = next(c for c in ("torque_target", "torque_applied", "torque_output") if c in df.columns)
     df["torque_output"] = -df[src]
 
     os.makedirs(args.output_dir, exist_ok=True)
