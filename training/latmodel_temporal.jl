@@ -141,11 +141,24 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
       data = filter(row -> row.standstill == false, data)
       println(out_streams, f"Filtered out {old_nrows - nrow(data)} standstill rows")
     end
+    if "lat_active" in names(data)
+      old_nrows = nrow(data)
+      data = filter(row -> row.lat_active == true, data)
+      println(out_streams, f"Filtered out {old_nrows - nrow(data)} rows with lateral control inactive")
+    end
+
+    # Target torque. torqueState.output and carOutput torque carry the actuators.torque sign (left positive), while
+    # the lateral accels are right positive and openpilot/sunnypilot add the NN output to a torque with the sign of
+    # the lateral accel. Train on the torque the car actually got (after the safety limits), with that sign.
+    target_col = "torque_applied" in names(data) ? :torque_applied : :torque_output
+    data[!, :torque_output] = -1f0 .* Float32.(data[!, target_col])
+    println(out_streams, "Target torque: -$(target_col)")
     # Select only columns needed for training (extractor outputs many extra columns)
     # Model inputs: v_ego, actual_lateral_accel, lateral_jerk (computed), roll, temporal lat accels, temporal rolls
     # Target: torque_output
-    temporal_lat_accel_cols = filter(c -> occursin(r"^actual_lateral_accel_t[mp]\d+$", c), names(data))
-    temporal_roll_cols = filter(c -> occursin(r"^roll_t[mp]\d+$", c), names(data))
+    temporal_suffixes = ["tm03", "tm02", "tm01", "tp03", "tp06", "tp10", "tp15"]  # -0.3 ... +1.5 s, runtime order
+    temporal_lat_accel_cols = ["actual_lateral_accel_$(t)" for t in temporal_suffixes]
+    temporal_roll_cols = ["roll_$(t)" for t in temporal_suffixes]
     keep_cols = vcat(["v_ego", "actual_lateral_accel", "roll", "torque_output"], temporal_lat_accel_cols, temporal_roll_cols)
     # Also keep actual_lateral_accel_tp03 for lateral_jerk computation (it's already in temporal cols)
     select!(data, Symbol.(keep_cols))
@@ -153,6 +166,12 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
     # Compute lateral_jerk from temporal data (not output by extractor)
     println(out_streams, "Computing lateral_jerk from temporal lateral accel")
     data[!, :lateral_jerk] = @fastmath @. (data[!, :actual_lateral_accel_tp03] - data[!, :actual_lateral_accel]) / 0.03f0
+
+    # Model inputs in the order openpilot/sunnypilot feed them at runtime: v_ego, lateral accel, jerk, roll,
+    # 7 lateral accels, 7 rolls. The physical-constraint grids and the plot filters below assume this order too.
+    # (lateral_jerk used to end up last, so every input from the third on was shifted at runtime.)
+    select!(data, Symbol.(vcat(["v_ego", "actual_lateral_accel", "lateral_jerk", "roll", "torque_output"],
+                               temporal_lat_accel_cols, temporal_roll_cols)))
 
     println(out_streams, f"Loaded {nrow(data)} rows")
     println(out_streams, f"Data {data[sample(1:nrow(data), 20), :]}")
@@ -530,7 +549,9 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
   # train the model (with batches of shuffled data)
   tol = log10(size(X_train, 1)) > 7 ? 1f-4 : 1f-6
   Δtol = log10(size(X_train, 1)) > 7 ? 1f-4 : 5f-5
-  logstep = device == gpu ? 50 : log10(size(X_train, 1)) > 7 ? 3 : 10
+  # Same schedule on CPU and GPU: the CPU branch used to stop after 150-1000 epochs or 15 loss upticks, before
+  # the physical-constraint penalties (origin, monotonic, odd) ramp up late in the run.
+  logstep = 50
   logstepgrowth = 1
   logstepfloat = Float32(logstep)
   Δloss = Inf32
@@ -538,11 +559,11 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
   Δloss_last = 0f0
   loss_last = Inf32
   loss_cur = 0f0
-  stall_check_count = device == gpu ? 50000 : 15
+  stall_check_count = 50000
   stall_count = 0
   epoch = 1
   ilog = logstep + 1
-  epoch_max = device == gpu ? 10000 : log10(size(X_train, 1)) > 6 ? 150 : 1000
+  epoch_max = 10000
   epoch_min = 25
   batch_size = size(y_train, 1)
 

@@ -265,6 +265,10 @@ def main():
 
     df = load_data(args.data)
     print(f"Loaded {len(df)} data rows")
+    # The model outputs torque with the sign of the lateral accel (what openpilot/sunnypilot expect); logged torques
+    # carry the actuators.torque sign. Compare like with like, using the torque the car actually got when logged.
+    src = "torque_applied" if "torque_applied" in df.columns else "torque_output"
+    df["torque_output"] = -df[src]
 
     os.makedirs(args.output_dir, exist_ok=True)
 
