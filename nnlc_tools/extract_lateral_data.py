@@ -8,11 +8,16 @@ Usage:
   python -m nnlc_tools.extract_lateral_data /path/to/rlogs/ -o output.csv
   python -m nnlc_tools.extract_lateral_data /path/to/rlogs/ -o output.parquet --format parquet
   python -m nnlc_tools.extract_lateral_data /path/to/rlogs/ -o output.csv --temporal
+  python -m nnlc_tools.extract_lateral_data /path/to/rlogs/ -o output.csv --temporal \\
+      --filter-overrides --override-margin 1.0 --stride 10   # 100+ hours of logs
 """
 
 import argparse
+import concurrent.futures
+import functools
 import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -42,16 +47,30 @@ COLUMNS = [
     "saturated",
     "roll",
     "lane_change_state",
+    "torque_applied",  # carOutput torque: what the car got after the safety limits (falls back to torque_output)
+    "lat_active",      # lateral control actually steering
+    "segment",         # route--segment, keeps temporal columns from spilling across segments
 ]
+
+# openpilot route--segment names: new style 00000016--6b14df1c14--29, old style 2024-01-15--12-30-45--5
+SEGMENT_RE = re.compile(r"(?:[0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})--\d+")
+
+
+def segment_name(path):
+    """route--segment from a device path (.../realdata/<route>--<seg>/rlog.zst) or a comma connect / flat file name
+    (<dongle>_<route>--<seg>--rlog.zst). Falls back to the path itself."""
+    found = SEGMENT_RE.findall(path.replace("\\", "/"))
+    return found[-1] if found else path
 
 
 def find_rlogs(input_dir):
     """Find all rlog files in the input directory."""
-    patterns = ["**/rlog.zst", "**/rlog.bz2", "**/rlog"]
+    patterns = ["**/rlog.zst", "**/rlog.bz2", "**/rlog",
+                "**/*--rlog.zst", "**/*--rlog.bz2", "**/*--rlog"]  # flat names: <dongle>_<route>--<seg>--rlog.zst
     files = []
     for pattern in patterns:
         files.extend(glob.glob(os.path.join(input_dir, pattern), recursive=True))
-    return sorted(set(files))
+    return sorted(f for f in set(files) if "qlog" not in os.path.basename(f))
 
 
 def extract_segment(rlog_path):
@@ -65,6 +84,7 @@ def extract_segment(rlog_path):
 
     rows = []
     sm = {}
+    segment = segment_name(rlog_path)
 
     try:
         lr = LogReader(rlog_path, sort_by_time=True)
@@ -74,7 +94,10 @@ def extract_segment(rlog_path):
 
     try:
         for msg in lr:
-            msg_type = msg.which()
+            try:
+                msg_type = msg.which()
+            except Exception:  # message type this schema doesn't know (fork-specific): not needed
+                continue
 
             if msg_type == "carState":
                 sm["carState"] = msg.carState
@@ -86,6 +109,8 @@ def extract_segment(rlog_path):
                 sm["liveParameters"] = msg.liveParameters
             elif msg_type == "modelV2":
                 sm["modelV2"] = msg.modelV2
+            elif msg_type == "carOutput":
+                sm["carOutput"] = msg.carOutput
 
             # Emit a row on each controlsState when we have carState too
             if msg_type == "controlsState" and "carState" in sm:
@@ -102,6 +127,7 @@ def extract_segment(rlog_path):
                 desired_lat_accel = float("nan")
                 torque_output = float("nan")
                 saturated = False
+                lat_active = False
 
                 if lat_type == "torqueState":
                     ts = lat_state.torqueState
@@ -109,10 +135,17 @@ def extract_segment(rlog_path):
                     desired_lat_accel = ts.desiredLateralAccel
                     torque_output = ts.output
                     saturated = ts.saturated
+                    lat_active = ts.active
                 elif lat_type == "pidState":
                     ps = lat_state.pidState
                     torque_output = ps.output
                     saturated = ps.saturated
+                    lat_active = ps.active
+
+                if "carOutput" in sm:
+                    torque_applied = sm["carOutput"].actuatorsOutput.torque
+                else:  # older logs without carOutput
+                    torque_applied = torque_output
 
                 # active moved from controlsState to selfdriveState in newer openpilot
                 if "selfdriveState" in sm:
@@ -148,6 +181,9 @@ def extract_segment(rlog_path):
                     saturated,
                     roll,
                     lane_change_state,
+                    torque_applied,
+                    lat_active,
+                    segment,
                 ]
                 rows.append(row)
     except Exception as e:
@@ -171,9 +207,34 @@ def add_temporal_columns(df):
 
         for col in temporal_cols:
             if col in df.columns:
-                df[f"{col}{suffix}"] = df[col].shift(-shift_frames)
+                if "segment" in df.columns:  # never pull values from the next segment / route
+                    df[f"{col}{suffix}"] = df.groupby("segment", sort=False)[col].shift(-shift_frames)
+                else:
+                    df[f"{col}{suffix}"] = df[col].shift(-shift_frames)
 
     return df
+
+
+def process_file(rlog_path, temporal=False, filter_overrides=False, override_margin=0.0, stride=1):
+    """Extract one segment into a DataFrame (temporal columns, override filter and stride applied at 100 Hz)."""
+    rows = extract_segment(rlog_path)
+    if not rows:
+        return None, 0
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    if temporal:
+        df = add_temporal_columns(df)
+    dropped = 0
+    if filter_overrides and "steering_pressed" in df.columns:
+        pressed = df["steering_pressed"].astype(bool).to_numpy().astype(np.int32)
+        w = int(round(override_margin / 0.01))
+        if w > 0:  # also drop the frames around the override (e.g. the Toyota EPS backs off around hand torque)
+            pressed = np.convolve(pressed, np.ones(2 * w + 1, dtype=np.int32), mode="same")
+        near = pressed > 0
+        dropped = int(near.sum())
+        df = df[~near]
+    if stride > 1:
+        df = df.iloc[::stride]
+    return df, dropped
 
 
 def main():
@@ -189,6 +250,14 @@ def main():
                         help="Add temporal lag/lead columns for NNLC training")
     parser.add_argument("--filter-overrides", action="store_true",
                         help="Drop rows where driver overrides (steering_pressed=True)")
+    parser.add_argument("--override-margin", type=float, default=0.0,
+                        help="With --filter-overrides, also drop rows within this many seconds of an override")
+    parser.add_argument("--stride", type=int, default=1,
+                        help="Keep every Nth row (controlsState is 100 Hz), after the temporal columns and the "
+                             "override filter. Use 5-10 for large data sets (100+ hours). nnlc-interventions needs "
+                             "100 Hz rows, so with --stride use --filter-overrides here instead.")
+    parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                        help="Parallel worker processes (default: all CPU cores)")
     args = parser.parse_args()
 
     if not os.path.isdir(args.input):
@@ -201,28 +270,15 @@ def main():
         sys.exit(1)
 
     print(f"Found {len(rlog_files)} rlog files")
-
-    all_rows = []
-    for rlog_path in tqdm(rlog_files, desc="Processing rlogs"):
-        rows = extract_segment(rlog_path)
-        all_rows.extend(rows)
-
-    if not all_rows:
-        print("ERROR: No data extracted from any rlog files")
-        sys.exit(1)
-
-    df = pd.DataFrame(all_rows, columns=COLUMNS)
-    print(f"Extracted {len(df)} rows")
-
-    if args.filter_overrides and "steering_pressed" in df.columns:
-        before = len(df)
-        df = df[~df["steering_pressed"].astype(bool)]
-        dropped = before - len(df)
-        print(f"Filtered {dropped} override rows ({dropped / before:.1%} of data)")
-
-    if args.temporal:
-        print("Adding temporal columns...")
-        df = add_temporal_columns(df)
+    seen, unique = set(), []
+    for f in rlog_files:  # the same segment in two places (device copy + comma connect download) counts once
+        seg = segment_name(f)
+        if seg not in seen:
+            seen.add(seg)
+            unique.append(f)
+    if len(unique) < len(rlog_files):
+        print(f"Skipping {len(rlog_files) - len(unique)} duplicate segments")
+    rlog_files = unique
 
     # Determine output format
     fmt = args.format
@@ -232,12 +288,33 @@ def main():
         else:
             fmt = "csv"
 
-    if fmt == "parquet":
-        df.to_parquet(args.output, index=False)
-    else:
-        df.to_csv(args.output, index=False)
+    # One segment at a time: temporal columns never cross segments, and CSV output is streamed so memory stays flat
+    # no matter how many hours of logs there are (parquet output is still collected in memory).
+    work = functools.partial(process_file, temporal=args.temporal, filter_overrides=args.filter_overrides,
+                             override_margin=args.override_margin, stride=args.stride)
+    total, dropped_overrides, first = 0, 0, True
+    parts = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max(1, args.jobs)) as pool:
+        for df, dropped in tqdm(pool.map(work, rlog_files, chunksize=4), total=len(rlog_files),
+                                desc="Processing rlogs"):
+            if df is None:
+                continue
+            dropped_overrides += dropped
+            total += len(df)
+            if fmt == "parquet":
+                parts.append(df)
+            else:
+                df.to_csv(args.output, mode="w" if first else "a", header=first, index=False)
+            first = False
 
-    print(f"Saved to {args.output} ({fmt})")
+    if total == 0:
+        print("ERROR: No data extracted from any rlog files")
+        sys.exit(1)
+    if fmt == "parquet":
+        pd.concat(parts, ignore_index=True).to_parquet(args.output, index=False)
+    if args.filter_overrides:
+        print(f"Filtered {dropped_overrides} override rows")
+    print(f"Saved {total} rows to {args.output} ({fmt})")
 
 
 if __name__ == "__main__":

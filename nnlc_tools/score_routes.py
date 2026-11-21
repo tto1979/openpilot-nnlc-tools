@@ -32,6 +32,10 @@ def extract_route_id(path):
     Paths look like: .../2024-01-15--12-30-45/0/rlog.zst
     Route ID is: 2024-01-15--12-30-45
     """
+    # new and old style route--segment names, device or flat (comma connect) layout
+    seg = re.findall(r"(?:[0-9a-f]{8}--[0-9a-f]{10}|\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})--\d+", path.replace("\\", "/"))
+    if seg:
+        return seg[-1].rsplit("--", 1)[0]
     parts = path.replace("\\", "/").split("/")
     for part in reversed(parts):
         # Match openpilot route ID pattern: hex|date--time
