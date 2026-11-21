@@ -8,7 +8,6 @@ packages = [
     "CSV",
     "DataFrames",
     "StatsBase",
-    "MultivariateStats",
     "Flux",
     "MLDataUtils",
     "MLUtils",
@@ -18,8 +17,6 @@ packages = [
     "Random",
     "ProgressMeter",
     "Zygote",
-    "Optim",
-    "FluxOptTools",
     "Plots",
     "BSON",
     "CategoricalArrays",
@@ -30,11 +27,15 @@ packages = [
     "Dates",
     "CUDA",
     "ArgParse",
-    "ModelingToolkit",
     "TeeStreams",
 ]
 
 Pkg.add(packages)
+
+# Current NVIDIA drivers (CUDA 13, also what RTX 50 cards come with) are refused by CUDA.jl 5.x
+# ("only supports NVIDIA drivers for CUDA 11.x or 12.x"). Insist on 6.x; if something holds it back, fail here.
+Pkg.add(Pkg.PackageSpec(name="CUDA", version="6"))
+Pkg.status(["CUDA", "Flux"])
 
 # Trigger precompilation
 println("Precompiling all packages...")

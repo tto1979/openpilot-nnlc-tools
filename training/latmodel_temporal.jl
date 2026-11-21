@@ -39,9 +39,8 @@
 using CSV
 using DataFrames
 using StatsBase
-using MultivariateStats
 using Flux
-using Flux: params, train!, mse
+using Flux: mse
 using Flux.Optimisers
 using MLUtils: DataLoader
 using MLDataUtils #: splitobs, rescale
@@ -51,7 +50,7 @@ using PyFormattedStrings
 using Base.Threads
 using Random
 using ProgressMeter
-using Zygote, Optim, FluxOptTools
+using Zygote
 using StatsBase: sample
 using Plots
 using Plots.PlotMeasures
@@ -66,7 +65,6 @@ using Dates
 try using Metal catch end
 try using CUDA; using CUDA: CuIterator catch end
 using ArgParse
-using Optim
 
 using TeeStreams
 
@@ -532,7 +530,7 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
         mse = Flux.Losses.mse(y_true, y_pred)
       end
       
-      l2 = λ ≈ 0f0 ? 0f0 : λ * sum(p -> sum(abs2, p), params(model))
+      l2 = λ ≈ 0f0 ? 0f0 : λ * sum(l -> sum(abs2, l.weight) + sum(abs2, l.bias), model.layers)
       physical_constraints = physical_constraint_losses(x, y_pred, λ_monotonic, λ_odd, λ_origin)
       
       @fastmath return mse + l2 + physical_constraints
@@ -728,7 +726,7 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
       eval_model = deepcopy(model)
       for layer in eval_model.layers
         if layer isa Dense
-          Flux.params(layer)[2] .= zeros(Float32, size(Flux.params(layer)[2]))
+          layer.bias .= 0f0
         end
       end
       steer_command = eval_model(input_data_scaled')
@@ -741,7 +739,7 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
 
   function evaluate_manually(model, x; zero_bias=false)
     for layer in model.layers
-      W, b = params(layer)
+      W, b = layer.weight, layer.bias
       W = W'
       b = b'
       if zero_bias
@@ -817,14 +815,14 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
 
   # save model to json for Python import
   function export_model_params_to_json(model::Chain, input_mean::Matrix{Float32}, input_std::Matrix{Float32}, filename::String, current_date_and_time, model_test_loss, input_vars)
-      W, b = params(model.layers[1])
+      W, b = model.layers[1].weight, model.layers[1].bias
       input_size = size(W, 2)
-      output_size = size(params(model.layers[end])[1], 1)
+      output_size = size(model.layers[end].weight, 1)
       params_dict = Dict{String, Any}("input_size" => input_size, "output_size" => output_size, "layers" => [], "input_mean" => input_mean, "input_std" => input_std, "current_date_and_time" => current_date_and_time, "model_test_loss" => model_test_loss, "input_vars" => input_vars)
 
       for (idx, layer) in enumerate(model.layers)
           if isa(layer, Dense)
-              W, b = params(layer)
+              W, b = layer.weight, layer.bias
               params_dict["layers"] = push!(params_dict["layers"], Dict(
                   "dense_$(idx)_W" => Array{Float32}(W'),
                   "dense_$(idx)_b" => Array{Float32}(b'),

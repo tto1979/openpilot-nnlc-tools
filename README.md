@@ -39,6 +39,13 @@ docker compose -f docker/docker-compose.yml run --rm train bash training/run.sh 
 ```
 
 (`nnlc-interventions` needs 100 Hz rows; with `--stride`, overrides are already removed by the extractor.)
+
+GPU: current NVIDIA drivers are for CUDA 13, which CUDA.jl 5.x refuses ("only supports NVIDIA drivers for CUDA 11.x
+or 12.x"), so the image installs CUDA.jl 6 (the build fails if something holds it back). Check before a long run:
+
+```bash
+docker compose -f docker/docker-compose.yml run --rm train julia training/gpu_check.jl
+```
 Use only logs driven with the stock torque controller (NNLC/NNFF off).
 
 ## Prerequisites
