@@ -1,0 +1,9 @@
+# Scripts and the Dockerfile run inside Linux containers: keep LF line endings even in Windows checkouts
+# (core.autocrlf would turn them into CRLF and bash then fails on the '\r').
+*.sh       text eol=lf
+*.command  text eol=lf
+Dockerfile text eol=lf
+*.jl       text eol=lf
+*.py       text eol=lf
+*.toml     text eol=lf
+*.yml      text eol=lf
