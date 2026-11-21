@@ -221,6 +221,10 @@ def process_file(rlog_path, temporal=False, filter_overrides=False, override_mar
     if not rows:
         return None, 0
     df = pd.DataFrame(rows, columns=COLUMNS)
+    # Lateral jerk the way the runtime measures it: from the wheel's motion (openpilot feeds the NN the steering-rate
+    # jerk). Centred difference over 0.1 s of the steering-angle lateral accel, at 100 Hz and inside this segment.
+    a = df["actual_lateral_accel"]
+    df["actual_lateral_jerk"] = (a.shift(-5) - a.shift(5)) / 0.1
     if temporal:
         df = add_temporal_columns(df)
     dropped = 0

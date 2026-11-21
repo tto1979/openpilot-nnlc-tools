@@ -157,13 +157,21 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
     temporal_suffixes = ["tm03", "tm02", "tm01", "tp03", "tp06", "tp10", "tp15"]  # -0.3 ... +1.5 s, runtime order
     temporal_lat_accel_cols = ["actual_lateral_accel_$(t)" for t in temporal_suffixes]
     temporal_roll_cols = ["roll_$(t)" for t in temporal_suffixes]
-    keep_cols = vcat(["v_ego", "actual_lateral_accel", "roll", "torque_output"], temporal_lat_accel_cols, temporal_roll_cols)
-    # Also keep actual_lateral_accel_tp03 for lateral_jerk computation (it's already in temporal cols)
+    jerk_cols = "actual_lateral_jerk" in names(data) ? ["actual_lateral_jerk"] : String[]
+    keep_cols = vcat(["v_ego", "actual_lateral_accel", "roll", "torque_output"], jerk_cols, temporal_lat_accel_cols, temporal_roll_cols)
     select!(data, Symbol.(keep_cols))
 
-    # Compute lateral_jerk from temporal data (not output by extractor)
-    println(out_streams, "Computing lateral_jerk from temporal lateral accel")
-    data[!, :lateral_jerk] = @fastmath @. (data[!, :actual_lateral_accel_tp03] - data[!, :actual_lateral_accel]) / 0.03f0
+    # The jerk input is where the model learns steering friction (extra torque to keep the wheel moving), and at
+    # runtime openpilot feeds it the jerk measured from the wheel's motion. Use the extractor's measured jerk; it used
+    # to be (a(+0.3 s) - a(now)) / 0.03, an exact combination of two other inputs (and 10x too big), so the model
+    # learned no friction response and the runtime friction override kicked in.
+    if "actual_lateral_jerk" in names(data)
+      println(out_streams, "lateral_jerk: measured from the wheel's motion (actual_lateral_jerk)")
+      rename!(data, :actual_lateral_jerk => :lateral_jerk)
+    else
+      println(out_streams, "WARNING: no actual_lateral_jerk column (old extract) - approximating jerk from the +0.3 s lateral accel; re-extract for a friction response")
+      data[!, :lateral_jerk] = @fastmath @. (data[!, :actual_lateral_accel_tp03] - data[!, :actual_lateral_accel]) / 0.3f0
+    end
 
     # Model inputs in the order openpilot/sunnypilot feed them at runtime: v_ego, lateral accel, jerk, roll,
     # 7 lateral accels, 7 rolls. The physical-constraint grids and the plot filters below assume this order too.
