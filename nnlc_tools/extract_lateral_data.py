@@ -228,7 +228,8 @@ def process_file(rlog_path, temporal=False, filter_overrides=False, override_mar
         pressed = df["steering_pressed"].astype(bool).to_numpy().astype(np.int32)
         w = int(round(override_margin / 0.01))
         if w > 0:  # also drop the frames around the override (e.g. the Toyota EPS backs off around hand torque)
-            pressed = np.convolve(pressed, np.ones(2 * w + 1, dtype=np.int32), mode="same")
+            # "full" + centre slice keeps the segment's length even when it is shorter than the window
+            pressed = np.convolve(pressed, np.ones(2 * w + 1, dtype=np.int32), mode="full")[w:w + len(pressed)]
         near = pressed > 0
         dropped = int(near.sum())
         df = df[~near]

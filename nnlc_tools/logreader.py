@@ -30,7 +30,14 @@ class LogReader:
         elif dat[:2] == b"BZ":
             dat = bz2.decompress(dat)
 
-        self._ents = capnp_log.Event.read_multiple_bytes(dat)
+        # A segment cut short (power off mid-write) ends in a partial message: keep everything before it
+        self._ents = []
+        try:
+            for ent in capnp_log.Event.read_multiple_bytes(dat):
+                self._ents.append(ent)
+        except Exception:
+            if not self._ents:
+                raise
 
         if sort_by_time:
             self._ents = sorted(self._ents, key=lambda e: e.logMonoTime)
