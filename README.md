@@ -6,6 +6,41 @@ NNLC replaces the standard torque lateral controller with a per-vehicle neural n
 
 This repo consolidates the scattered, broken tooling into one place. Discussion and support on the [Sunnypilot forum](https://community.sunnypilot.ai/t/nnlc-tools-repo-for-complete-training-to-driving/3283).
 
+## TOP fork notes
+
+This fork fixes things that made the trained model not match what openpilot / sunnypilot feed it at runtime, and
+makes the tools handle large log collections:
+
+- **Model input order** now matches the runtime: v_ego, lateral accel, **jerk, roll**, 7 lateral accels, 7 rolls.
+  (`lateral_jerk` used to be appended last, which shifted every input from the third on — and the trainer's own
+  physical-constraint grids and plot filters already assumed the runtime order.)
+- **Torque sign**: logged torques (`torqueState.output`, `carOutput`) carry the actuators.torque sign (left positive),
+  the lateral accels are right positive. The target is now flipped to the sign the runtime expects, and is the torque
+  the car actually got after the safety limits (`carOutput`, new column `torque_applied`).
+- **CPU training uses the GPU schedule** (10000 epochs, no early stop). The CPU branch used to stop after 150–1000
+  epochs or 15 loss upticks, before the physical-constraint penalties ramp up.
+- **Extractor**: finds flat file names (`<dongle>_<route>--<seg>--rlog.zst`, as downloaded from comma connect) and new
+  style route names, skips message types the schema doesn't know (fork logs), keeps temporal columns inside each
+  segment, drops rows where lateral control isn't steering (`lat_active`), streams CSV output, runs in parallel
+  (`-j`), and can drop the frames around overrides (`--filter-overrides --override-margin 1.0`) and downsample
+  (`--stride 10`) for 100+ hours of logs.
+
+Large data set, e.g. rlogs in `Q:\op_rlogs` on Windows: put `NNLC_DATA_DIR=Q:/op_rlogs` in `docker/.env`, then
+
+```bash
+docker compose -f docker/docker-compose.yml build
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-extract /app/data -o /app/output/lateral_data.csv \
+    --temporal --filter-overrides --override-margin 1.0 --stride 10
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-prune-routes /app/output/lateral_data.csv \
+    -o /app/output/lateral_data_pruned.csv
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-visualize /app/output/lateral_data_pruned.csv \
+    -o /app/output/coverage.png
+docker compose -f docker/docker-compose.yml run --rm train bash training/run.sh /app/output/lateral_data_pruned.csv
+```
+
+(`nnlc-interventions` needs 100 Hz rows; with `--stride`, overrides are already removed by the extractor.)
+Use only logs driven with the stock torque controller (NNLC/NNFF off).
+
 ## Prerequisites
 
 - **Python 3.11+**
