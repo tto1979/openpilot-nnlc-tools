@@ -34,6 +34,12 @@ RUN curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel 1.1
 COPY training/install_packages.jl training/install_packages.jl
 RUN julia training/install_packages.jl
 
+# There is no GPU while building, so CUDA.jl can't pick a CUDA runtime by itself ("CUDA.jl's JLLs were precompiled
+# without an NVIDIA driver present"). Pin one - 12.9 runs RTX 50 cards (needs >= 12.8) on CUDA 12 and 13 drivers -
+# then fetch its artifacts and precompile in a fresh process, so `docker run` has everything.
+RUN julia -e 'using CUDA; CUDA.set_runtime_version!(v"12.9")' \
+ && julia -e 'import Pkg; Pkg.instantiate(); using CUDA, cuDNN, Flux'
+
 # Application code (changes often — fast rebuild)
 COPY . .
 

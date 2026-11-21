@@ -26,6 +26,7 @@ packages = [
     "JSON",
     "Dates",
     "CUDA",
+    "cuDNN",
     "ArgParse",
     "TeeStreams",
 ]
