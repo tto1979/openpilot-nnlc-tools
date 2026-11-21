@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Training target from the torque that actually turned the wheel, for openpilot-steered and hand-driven frames.
+"""Training target in steering-command units, for openpilot-steered and hand-driven frames.
 
-Training on the steering command alone (openpilot-steered frames only) teaches the model the controller that was
-running when the data was recorded, including its friction setting. twilsonco's first NNLC models were trained on
-hand-driven data, where the driver supplies the friction torque, using the measured EPS torque scaled to command
-units. This step does the same and adds the driver's own torque:
+Training on openpilot-steered frames only teaches the model the controller that was running when the data was
+recorded. twilsonco's first NNLC models were trained on hand-driven data, where the driver supplies the torque, using
+the measured EPS torque. This step adds hand-driven frames, in the units the model outputs at runtime:
 
-    torque_target = k * (steering_torque_eps + c * steering_torque)
+  openpilot-steered  the command openpilot sent (torque_applied)
+  hand-driven        k * (steering_torque_eps + c * steering_torque)
 
-    k  EPS units -> command units, from openpilot-steered frames with hands off (EPS torque follows the command there)
-    c  driver torque -> EPS units, from hand-driven steady curves: the torque they need matches what openpilot needed in
-          the same speed / lateral accel bin. c = 0 is twilsonco's EPS-only target.
+  k  EPS units -> command units, from steered hands-off frames (the EPS torque follows the command there)
+  c  driver torque -> EPS units: in each speed / lateral accel bin of steady curves, the hand-driven torque should match
+     the command openpilot needed. Fitted on the bin medians: a fit on single frames is pulled towards 0 by how much the
+     driver's torque wanders, which made hand-driven curves look like they need less torque than they do.
+     c = 0 is twilsonco's EPS-only target.
 
 Frames kept:
-    steered      lateral control active (includes lateral-only modes), not standstill
-    hand-driven  lateral control off, no torque command, >= 5 m/s, |a_ego| < 2.5
+  steered      lateral control active (includes lateral-only modes), not standstill
+  hand-driven  lateral control off, no torque command, >= 5 m/s, |a_ego| < 2.5
 
 Usage:
-    nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv
-    nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --driver-scale 0    # EPS torque only (twilsonco)
-    nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --steered-only      # same target, no hand-driven frames
+  nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv
+  nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --driver-scale 0    # EPS torque only (twilsonco)
+  nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --steered-only      # no hand-driven frames
 """
 
 import argparse
@@ -70,33 +72,49 @@ def steady_bins(df, rows):
 
 
 def fit_driver_scale(df, steered, hand, k):
-    """Driver torque -> EPS units, so hand-driven steady curves need the torque openpilot needed in the same bin."""
-    eps, drv = df["steering_torque_eps"].to_numpy(), df["steering_torque"].to_numpy()
+    """Driver torque -> EPS units: weighted least squares on per-bin medians (speed x gravity-adjusted lateral accel) of
+    steady curves, so that k * (EPS + c * driver) matches the command openpilot needed in the same bin."""
+    eps, drv, cmd = df["steering_torque_eps"].to_numpy(), df["steering_torque"].to_numpy(), df["torque_applied"].to_numpy()
     ms, key = steady_bins(df, steered & (np.abs(drv) <= np.nanpercentile(np.abs(drv[steered]), 50)))
     mh, _ = steady_bins(df, hand)
-    need = pd.Series(k * eps[ms]).groupby(key[ms]).agg(["median", "size"])
+    need = pd.Series(cmd[ms]).groupby(key[ms]).agg(["median", "size"])
     need = need[need["size"] >= 30]["median"]
     sel = mh & np.isin(key, need.index.to_numpy())
     n = int(sel.sum())
     if n < 500:
         return 0.0, {"n": n, "reason": f"only {n} hand-driven steady-curve frames (need 500)"}
-    needed = need.reindex(key[sel]).to_numpy()
-    r = needed - k * eps[sel]
-    d = k * drv[sel]
-    keep = np.ones(n, bool)
-    for _ in range(3):  # least squares, then drop outliers (3 MAD) and refit
-        c = float(np.sum(r[keep] * d[keep]) / np.sum(d[keep] ** 2))
-        res = r - c * d
-        mad = np.median(np.abs(res[keep] - np.median(res[keep]))) + 1e-9
-        keep = np.abs(res - np.median(res[keep])) < 3 * 1.4826 * mad
-    rms0 = float(np.sqrt(np.mean(r[keep] ** 2)))
-    rms1 = float(np.sqrt(np.mean((r[keep] - c * d[keep]) ** 2)))
-    share = float(np.median(np.abs(c * drv[sel]) / (np.abs(eps[sel] + c * drv[sel]) + 1e-9)))
-    info = {"n": n, "rms_eps_only": rms0, "rms_with_driver": rms1, "driver_share": share}
-    if not np.isfinite(c) or c <= 0 or rms1 >= rms0:
-        info["reason"] = f"fit gave c = {c:.3g} (rms {rms0:.3f} -> {rms1:.3f}), not usable"
+    frames = pd.DataFrame({"key": key[sel], "e": k * eps[sel], "d": k * drv[sel]})
+    hb = frames.groupby("key").agg(e=("e", "median"), d=("d", "median"), w=("e", "size"))
+    hb = hb[hb["w"] >= 20]
+    if len(hb) < 10:
+        return 0.0, {"n": n, "reason": f"only {len(hb)} speed / lateral accel bins with 20+ hand-driven frames (need 10)"}
+    N = need.reindex(hb.index).to_numpy()
+    E, D, W = hb["e"].to_numpy(), hb["d"].to_numpy(), hb["w"].to_numpy()
+    c = float(np.sum(W * D * (N - E)) / np.sum(W * D * D))
+    rel0 = float(np.sum(W * np.abs(N - E)) / np.sum(W * np.abs(N)))
+    rel1 = float(np.sum(W * np.abs(N - E - c * D)) / np.sum(W * np.abs(N)))
+    share = float(np.sum(W * np.abs(c * D)) / np.sum(W * np.abs(E + c * D)))
+    info = {"n": n, "bins": len(hb), "err_eps_only": rel0, "err_with_driver": rel1, "driver_share": share}
+    if not np.isfinite(c) or c <= 0:
+        info["reason"] = f"fit gave c = {c:.3g}, not usable"
         return 0.0, info
     return c, info
+
+
+def curve_report(df, steered, hand, out=print):
+    """Steady curves by speed: median torque (lateral accel sign) openpilot needed vs the hand-driven target."""
+    a = (df["actual_lateral_accel"] - G * df["roll"]).to_numpy()
+    v = df["v_ego"].to_numpy() * 3.6
+    y = -df["torque_target"].to_numpy() * np.sign(a)
+    jerk = df["actual_lateral_jerk"].abs().to_numpy() if "actual_lateral_jerk" in df else np.zeros(len(df))
+    base = (jerk < 0.3) & (np.abs(a) >= 1.0) & (np.abs(a) <= 2.0)
+    out("  steady curves, |lateral accel| 1-2 m/s^2: median torque openpilot needed vs hand-driven target")
+    for lo, hi in ((40, 70), (70, 95), (95, 115), (115, 140)):
+        sp = base & (v >= lo) & (v < hi)
+        s, h = sp & steered, sp & hand
+        if s.sum() >= 30 and h.sum() >= 30:
+            ms, mh = np.median(y[s] / np.abs(a[s])), np.median(y[h] / np.abs(a[h]))
+            out(f"  {lo:3d}-{hi:<3d} km/h: openpilot {ms:.3f}, hand-driven {mh:.3f} per m/s^2 ({(mh / ms - 1) * 100:+.0f}%)")
 
 
 def friction_report(df, steered, hand, out=print):
@@ -140,22 +158,25 @@ def build(df, driver_scale=None, steered_only=False, out=print):
         if "reason" in info:
             out(f"driver torque scale: 0 (EPS torque only) - {info['reason']}")
         else:
-            out(f"driver torque scale: 1 driver unit = {c:.2f} EPS units, from {info['n']:,} hand-driven steady-curve frames; "
-                f"rms vs openpilot's torque {info['rms_eps_only']:.3f} -> {info['rms_with_driver']:.3f}; "
-                f"the driver's hand is {info['driver_share'] * 100:.0f}% of the total there")
+            out(f"driver torque scale: 1 driver unit = {c:.2f} EPS units, from {info['n']:,} hand-driven steady-curve frames "
+                f"in {info['bins']} bins; error vs openpilot's command {info['err_eps_only'] * 100:.0f}% -> "
+                f"{info['err_with_driver'] * 100:.0f}%; the driver's hand is {info['driver_share'] * 100:.0f}% of the total there")
     else:
         c = float(driver_scale)
         out(f"driver torque scale: {c:.2f} (given)")
     keep = steered | hand
     res = df[keep].copy()
-    res["torque_target"] = k * (res["steering_torque_eps"] + c * res["steering_torque"])
-    res["source"] = np.where(steered[keep], STEERED, HAND).astype(np.int8)
+    is_steered = steered[keep]
+    hand_torque = k * (res["steering_torque_eps"].to_numpy() + c * res["steering_torque"].to_numpy())
+    res["torque_target"] = np.where(is_steered, res["torque_applied"].to_numpy(), hand_torque)
+    res["source"] = np.where(is_steered, STEERED, HAND).astype(np.int8)
     big = res["torque_target"].abs() > 1.5
     if big.any():
         out(f"dropped {int(big.sum()):,} frames needing more than 1.5x the maximum command")
         res = res[~big]
     s = res["source"].to_numpy()
     friction_report(res, s == STEERED, s == HAND, out=out)
+    curve_report(res, s == STEERED, s == HAND, out=out)
     return res, k, c
 
 

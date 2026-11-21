@@ -53,13 +53,16 @@ data instead, where the driver supplies the friction torque. `nnlc-torque-target
   steering angle with the vehicle model (carParams + liveParameters) for every frame, the same number the torque
   controller logs (`actual_lateral_accel_ctrl`, which is 0 while the controller isn't steering). `--filter-overrides`
   only drops openpilot-steered frames.
-- Target for both kinds of frame: `k * (EPS torque + c * driver torque)`. `k` (EPS units to command units) comes from
-  steered hands-off frames, `c` (driver torque to EPS units) from hand-driven steady curves, matched to the torque
-  openpilot needed in the same speed / lateral accel bin. `--driver-scale 0` is twilsonco's EPS-only target.
+- Target in command units, what the model outputs at runtime: the command openpilot sent for steered frames,
+  `k * (EPS torque + c * driver torque)` for hand-driven frames. `k` (EPS units to command units) comes from steered
+  hands-off frames, `c` (driver torque to EPS units) from steady curves: per speed / lateral accel bin, the median
+  hand-driven torque has to match the command openpilot needed. (A fit on single frames is pulled towards 0 by how
+  much the driver's torque wanders, which made hand-driven curves look like they need less torque than they do.)
+  `--driver-scale 0` is twilsonco's EPS-only target.
 - Hand-driven = lateral control off and no torque command, at 5 m/s or more. Lateral-only modes (openpilot steering
   while not engaged) count as openpilot-steered.
-- It prints the friction each kind of frame shows near straight (torque per lateral jerk), so you can see what the hand
-  data adds before training. The trainer uses `torque_target` and keeps the hand-driven rows when the column is there.
+- It prints the friction each kind of frame shows near straight (torque per lateral jerk) and, for steady curves by
+  speed, the torque openpilot needed next to the hand-driven target, so you can check the two agree before training. The trainer uses `torque_target` and keeps the hand-driven rows when the column is there.
 
 Re-extract (the old CSV has no EPS torque), then:
 
