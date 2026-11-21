@@ -32,11 +32,14 @@ docker compose -f docker/docker-compose.yml build
 docker compose -f docker/docker-compose.yml run --rm tools nnlc-extract /app/data -o /app/output/lateral_data.csv \
     --temporal --filter-overrides --override-margin 1.0 --stride 10
 docker compose -f docker/docker-compose.yml run --rm tools nnlc-prune-routes /app/output/lateral_data.csv \
-    -o /app/output/lateral_data_pruned.csv
-docker compose -f docker/docker-compose.yml run --rm tools nnlc-visualize /app/output/lateral_data_pruned.csv \
+    -o /app/output/TOYOTA_PRIUS_V.csv
+docker compose -f docker/docker-compose.yml run --rm tools nnlc-visualize /app/output/TOYOTA_PRIUS_V.csv \
     -o /app/output/coverage.png
-docker compose -f docker/docker-compose.yml run --rm train bash training/run.sh /app/output/lateral_data_pruned.csv
+docker compose -f docker/docker-compose.yml run --rm train bash training/run.sh /app/output/TOYOTA_PRIUS_V.csv
 ```
+
+The model is named after the training CSV, so name it after the car fingerprint: the example writes
+`output/training_results/TOYOTA_PRIUS_V/TOYOTA_PRIUS_V.json` (later runs add `_1`, `_2`, ...).
 
 (`nnlc-interventions` needs 100 Hz rows; with `--stride`, overrides are already removed by the extractor.)
 

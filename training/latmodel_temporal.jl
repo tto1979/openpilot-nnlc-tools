@@ -1319,7 +1319,15 @@ function create_model(in_file, out_dir_base; force_cpu::Bool=false)
 end
 
 function main(in_dir; force_cpu::Bool=false)
-  # Get all CSV files that aren't balanced files
+  # A single CSV (as the README shows): train just that one. The model is named after the file, so name it after the
+  # car fingerprint, e.g. TOYOTA_PRIUS_V.csv -> training_results/TOYOTA_PRIUS_V/TOYOTA_PRIUS_V.json
+  if isfile(in_dir)
+    results_dir = joinpath(dirname(abspath(in_dir)), "training_results")
+    mkpath(results_dir)
+    create_model(abspath(in_dir), results_dir; force_cpu=force_cpu)
+    return
+  end
+  # A folder: train every CSV in it that isn't a balanced file
   csv_files = filter(file -> occursin(".csv", file) && !occursin("_balanced.csv", file), readdir(in_dir))
 
   results_dir = joinpath(in_dir, "training_results")
