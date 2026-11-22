@@ -58,7 +58,8 @@ data instead, where the driver supplies the friction torque. `nnlc-torque-target
   hands-off frames, `c` (driver torque to EPS units) from steady curves: per speed / lateral accel bin, the median
   hand-driven torque has to match the command openpilot needed. (A fit on single frames is pulled towards 0 by how
   much the driver's torque wanders, which made hand-driven curves look like they need less torque than they do.)
-  `--driver-scale 0` is twilsonco's EPS-only target.
+  `--driver-scale 0` is twilsonco's EPS-only target. `--hand-max-lat-accel 0.5` keeps hand-driven frames only near
+  straight (their friction), so the torque for holding a curve comes from openpilot-steered frames.
 - Hand-driven = lateral control off and no torque command, at 5 m/s or more. Lateral-only modes (openpilot steering
   while not engaged) count as openpilot-steered.
 - It prints the friction each kind of frame shows near straight (torque per lateral jerk) and, for steady curves by

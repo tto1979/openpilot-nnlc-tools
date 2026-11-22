@@ -22,6 +22,7 @@ Usage:
   nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv
   nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --driver-scale 0    # EPS torque only (twilsonco)
   nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --steered-only      # no hand-driven frames
+  nnlc-torque-target pruned.csv -o TOYOTA_PRIUS_V.csv --hand-max-lat-accel 0.5   # hand frames near straight only
 """
 
 import argparse
@@ -141,7 +142,7 @@ def friction_report(df, steered, hand, out=print):
         out(f"  {lo:5.2f}-{hi:<5.2f}  " + "".join(f"{c:>18s}" for c in cells))
 
 
-def build(df, driver_scale=None, steered_only=False, out=print):
+def build(df, driver_scale=None, steered_only=False, hand_max_lat_accel=None, out=print):
     for col in ("steering_torque_eps", "steering_torque", "lat_active", "torque_applied"):
         if col not in df:
             raise SystemExit(f"ERROR: column {col} missing - re-extract with this version of nnlc-extract")
@@ -164,6 +165,9 @@ def build(df, driver_scale=None, steered_only=False, out=print):
     else:
         c = float(driver_scale)
         out(f"driver torque scale: {c:.2f} (given)")
+    if hand_max_lat_accel is not None:  # after the driver scale fit, which needs the hand-driven curves
+        hand = hand & (np.abs(df["actual_lateral_accel"].to_numpy()) < hand_max_lat_accel)
+        out(f"hand-driven frames kept below {hand_max_lat_accel} m/s^2 lateral accel: {hand.sum():,}")
     keep = steered | hand
     res = df[keep].copy()
     is_steered = steered[keep]
@@ -187,10 +191,13 @@ def main():
     p.add_argument("--driver-scale", type=float, default=None,
                    help="Driver torque -> EPS units instead of fitting it (0 = EPS torque only, as twilsonco)")
     p.add_argument("--steered-only", action="store_true", help="Leave out hand-driven frames")
+    p.add_argument("--hand-max-lat-accel", type=float, default=None,
+                   help="Keep hand-driven frames only below this lateral accel (m/s^2): their friction near "
+                        "straight, openpilot's torque in curves")
     args = p.parse_args()
     df = pd.read_csv(args.input)
     print(f"Loaded {len(df):,} rows")
-    res, _, _ = build(df, args.driver_scale, args.steered_only)
+    res, _, _ = build(df, args.driver_scale, args.steered_only, args.hand_max_lat_accel)
     res.to_csv(args.output, index=False)
     print(f"Saved {len(res):,} rows to {args.output}")
 
