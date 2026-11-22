@@ -25,6 +25,12 @@ makes the tools handle large log collections:
 - **`--wide`**: 14 and 16 units in the hidden sigmoid layers instead of 7 and 13 (openpilot / sunnypilot load any
   layer sizes). The small net, even fully trained, traded the friction response near straight for the torque in
   gentle curves. Use both: `julia training/latmodel_temporal.jl data.csv --adam --wide`.
+- **Physical-constraint penalties reach the weights.** They read the `model` captured from `train_model` instead of
+  the one being differentiated, so they showed in the logged loss but never changed the model (Prius v: monotonic
+  violations summed to 90-138 at the end of a run, the 2024 model 0.02). They now take the model as an argument
+  and run every epoch once they ramp up, plus a dense curve-entry grid (jerk -2 to 2, lateral accel -3 to 3) so
+  torque can't fall while jerk rises. The log ends with the violations left; expect monotonic and curve-entry
+  near 0.
 - **Extractor**: finds flat file names (`<dongle>_<route>--<seg>--rlog.zst`, as downloaded from comma connect) and new
   style route names, skips message types the schema doesn't know (fork logs), keeps temporal columns inside each
   segment, drops rows where lateral control isn't steering (`lat_active`), streams CSV output, runs in parallel

@@ -468,57 +468,58 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
   grid_dg_rate = prepare_test_grid(lj_func, v_ego_range, lateral_acceleration_range, lateral_jerk_range, roll_range_hi, lateral_error_range, roll_rate_range_hi)
   grid_odd_neg = prepare_test_grid(lj_func, v_ego_range, -lateral_acceleration_range, -lateral_jerk_range, -roll_range, -lateral_error_range, -roll_rate_range)
   grid_origin = prepare_test_grid(lj_func, v_ego_range, 0, 0, 0, 0, 0)
+  # Curve-entry grid: the inputs the controller sends as a curve starts (future lateral accels = la + jerk * t, no
+  # error or roll), dense over the range seen on the road. The grids above step jerk by 2.5 and lateral accel by
+  # 2 m/s², so torque could fall while jerk rises between their points.
+  entry_v_range = range(1f0, stop=40f0, length=8)
+  entry_la_range = range(-3f0, stop=3f0, length=13)
+  entry_lj_range = range(-2f0, stop=2f0, length=17)
+  grid_entry = prepare_test_grid(lj_func, entry_v_range, entry_la_range, entry_lj_range, 0f0, 0f0, 0f0)
+  grid_entry_dj = prepare_test_grid(lj_func, entry_v_range, entry_la_range, entry_lj_range .+ 0.1f0, 0f0, 0f0, 0f0)
+  # The curve-entry grid has 1768 points against 25000 per grid above, so each of its violations counts more.
+  entry_weight = 20f0
 
   varnames = join(names(select(data, Not([:torque_output]))), ", ")
 
-  # Cache for physical constraint losses (recomputed every N epochs)
-  cached_constraint_loss = Ref(0f0)
-  constraint_eval_interval = 10
+  # Sums of squared violations. d(output)/d(lat accel/jerk) and d(output)/d(error) should be positive,
+  # d(output)/d(roll) and d(output)/d(roll_rate) should be negative.
+  monotonic_violations(model, model_grid) = sum(abs2, max.(0f0, (model(grid_da) .- model_grid) .* -1f0)) +
+                                            sum(abs2, max.(0f0, (model(grid_dj) .- model_grid) .* -1f0)) +
+                                            sum(abs2, max.(0f0, (model(grid_de) .- model_grid) .* -1f0)) +
+                                            sum(abs2, max.(0f0, model(grid_dg) .- model_grid)) +
+                                            sum(abs2, max.(0f0, model(grid_dg_rate) .- model_grid))
+  entry_violations(model) = sum(abs2, max.(0f0, model(grid_entry) .- model(grid_entry_dj)))
+  odd_violations(model, model_grid) = sum(abs2, model_grid .+ model(grid_odd_neg))
+  origin_violations(model) = sum(abs2, model(grid_origin))
 
-  function physical_constraint_losses(x, y_pred, λ_monotonic::Float32, λ_odd::Float32, λ_origin::Float32) :: Float32
+  # Takes the model being differentiated and runs every epoch. It used to read the `model` captured from
+  # train_model, cached for 10 epochs; Flux.gradient(model) do model ... only follows the argument, so the
+  # penalties showed in the logged loss but never reached the weights (Prius v: monotonic violations summed to
+  # 90-138 at the end of a run, the 2024 model 0.02).
+  function physical_constraint_losses(model, λ_monotonic::Float32, λ_odd::Float32, λ_origin::Float32) :: Float32
       if λ_monotonic ≈ 0f0 && λ_odd ≈ 0f0 && λ_origin ≈ 0f0
           return 0f0
       end
 
-      # Only recompute every N epochs and cache the result
-      if epoch % constraint_eval_interval != 0
-          return cached_constraint_loss[]
-      end
-      
       monotonicity_loss = 0f0
       odd_loss = 0f0
       origin_loss = 0f0
 
       model_grid = model(grid)
-      
-      if λ_monotonic ≉ 0f0
-          model_da = model(grid_da)
-          model_dj = model(grid_dj)
-          model_de = model(grid_de)
-          model_dg = model(grid_dg)
-          model_dgr = model(grid_dg_rate)
 
-          # d(output)/d(lat accel/jerk) and d(output)/d(error) should be positive,
-          # d(output)/d(roll) and d(output)/d(roll_rate) should be negative
-          @fastmath monotonicity_loss = sum(abs2, max.(0f0, (model_da .- model_grid) .* -1f0)) +
-                              sum(abs2, max.(0f0, (model_dj .- model_grid) .* -1f0)) +
-                              sum(abs2, max.(0f0, (model_de .- model_grid) .* -1f0)) +
-                              sum(abs2, max.(0f0, model_dg .- model_grid)) +
-                              sum(abs2, max.(0f0, model_dgr .- model_grid))  
+      if λ_monotonic ≉ 0f0
+          monotonicity_loss = monotonic_violations(model, model_grid) + entry_weight * entry_violations(model)
       end
-      
+
       if λ_odd ≉ 0f0
-          model_odd_neg = model(grid_odd_neg)
-          @fastmath odd_loss = sum(abs2, model_grid .+ model_odd_neg)
+          odd_loss = odd_violations(model, model_grid)
       end
 
       if λ_origin ≉ 0f0
-          @fastmath origin_loss = sum(abs2, model(grid_origin))
+          origin_loss = origin_violations(model)
       end
 
-      result = @fastmath λ_monotonic * monotonicity_loss + λ_odd * odd_loss + λ_origin * origin_loss
-      cached_constraint_loss[] = result
-      return result
+      return λ_monotonic * monotonicity_loss + λ_odd * odd_loss + λ_origin * origin_loss
   end
 
   function model_with_params(model, params)
@@ -552,7 +553,7 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
       end
       
       l2 = λ ≈ 0f0 ? 0f0 : λ * sum(l -> sum(abs2, l.weight) + sum(abs2, l.bias), model.layers)
-      physical_constraints = physical_constraint_losses(x, y_pred, λ_monotonic, λ_odd, λ_origin)
+      physical_constraints = physical_constraint_losses(model, λ_monotonic, λ_odd, λ_origin)
       
       @fastmath return mse + l2 + physical_constraints
   end
@@ -614,6 +615,8 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
     grid_dg_rate = grid_dg_rate |> device
     grid_odd_neg = grid_odd_neg |> device
     grid_origin = grid_origin |> device
+    grid_entry = grid_entry |> device
+    grid_entry_dj = grid_entry_dj |> device
     
     λmax = 0.000f0
     λ_monotonicmax = 0.0015f0
@@ -696,6 +699,12 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
     Δloss = loss_cur - loss_last
     cur_time = Dates.format(now(), "HH:MM:SS")
     println(out_streams, f"round 1 {cur_time} Epoch: {epoch:3d} (of {epoch_max}; Loss: {loss_cur:.6f}, ΔLoss: {Δloss:.7f}, ΔΔLoss: {ΔΔloss:.9f}")
+    model_grid_end = model(grid)
+    v_monotonic = monotonic_violations(model, model_grid_end)
+    v_entry = entry_violations(model)
+    v_odd = odd_violations(model, model_grid_end)
+    v_origin = origin_violations(model)
+    println(out_streams, f"Physical constraint violations (sums of squares): monotonic {v_monotonic:.4f}, curve-entry jerk {v_entry:.4f}, odd {v_odd:.3f}, origin {v_origin:.5f}")
 
     # save the model for easy loading back into Flux.jl
       # bring data back to cpu
@@ -713,6 +722,8 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
       grid_dg_rate = cpu(grid_dg_rate)
       grid_odd_neg = cpu(grid_odd_neg)
       grid_origin = cpu(grid_origin)
+      grid_entry = cpu(grid_entry)
+      grid_entry_dj = cpu(grid_entry_dj)
     end
 
     @save "$model_path.bson" model
