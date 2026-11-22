@@ -468,16 +468,19 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
   grid_dg_rate = prepare_test_grid(lj_func, v_ego_range, lateral_acceleration_range, lateral_jerk_range, roll_range_hi, lateral_error_range, roll_rate_range_hi)
   grid_odd_neg = prepare_test_grid(lj_func, v_ego_range, -lateral_acceleration_range, -lateral_jerk_range, -roll_range, -lateral_error_range, -roll_rate_range)
   grid_origin = prepare_test_grid(lj_func, v_ego_range, 0, 0, 0, 0, 0)
-  # Curve-entry grid: the inputs the controller sends as a curve starts (future lateral accels = la + jerk * t, no
-  # error or roll), dense over the range seen on the road. The grids above step jerk by 2.5 and lateral accel by
-  # 2 m/s², so torque could fall while jerk rises between their points.
-  entry_v_range = range(1f0, stop=40f0, length=8)
+  # Curve-entry grid: the inputs the controller sends as a curve starts or reverses (future lateral accels =
+  # la + jerk * t, no error or roll), dense over the range seen on the road: speed every 10 km/h, lateral accel
+  # every 0.5 m/s², jerk every 0.25 m/s³. The grids above step jerk by 2.5 and lateral accel by 2 m/s², so torque
+  # could fall while jerk rises between their points.
+  entry_v_range = range(1f0, stop=40f0, length=15)
   entry_la_range = range(-3f0, stop=3f0, length=13)
   entry_lj_range = range(-2f0, stop=2f0, length=17)
   grid_entry = prepare_test_grid(lj_func, entry_v_range, entry_la_range, entry_lj_range, 0f0, 0f0, 0f0)
   grid_entry_dj = prepare_test_grid(lj_func, entry_v_range, entry_la_range, entry_lj_range .+ 0.1f0, 0f0, 0f0, 0f0)
-  # The curve-entry grid has 1768 points against 25000 per grid above, so each of its violations counts more.
-  entry_weight = 20f0
+  # Each violation here is the torque lost over a 0.1 m/s³ jerk step, a few thousandths, so its square is tiny next to
+  # the fit error. At weight 20 a Prius v model still let torque fall 0.03 while the wheel unwound fast through center
+  # (65-110 km/h, lateral accel about to cross zero); 2000 removes it at no cost to the fit.
+  entry_weight = 2000f0
 
   varnames = join(names(select(data, Not([:torque_output]))), ", ")
 
