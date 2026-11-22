@@ -19,6 +19,12 @@ makes the tools handle large log collections:
   the car actually got after the safety limits (`carOutput`, new column `torque_applied`).
 - **CPU training uses the GPU schedule** (10000 epochs, no early stop). The CPU branch used to stop after 150–1000
   epochs or 15 loss upticks, before the physical-constraint penalties ramp up.
+- **`--adam`** (`julia training/latmodel_temporal.jl data.csv --adam`): Adam with the learning rate decaying 3e-3 to
+  3e-4 instead of full-batch AdaGrad, whose steps keep shrinking so the fit stops short. On the Prius v data the
+  AdaGrad model gave 15-20% too much torque in gentle curves on its own training data.
+- **`--wide`**: 14 and 16 units in the hidden sigmoid layers instead of 7 and 13 (openpilot / sunnypilot load any
+  layer sizes). The small net, even fully trained, traded the friction response near straight for the torque in
+  gentle curves. Use both: `julia training/latmodel_temporal.jl data.csv --adam --wide`.
 - **Extractor**: finds flat file names (`<dongle>_<route>--<seg>--rlog.zst`, as downloaded from comma connect) and new
   style route names, skips message types the schema doesn't know (fork logs), keeps temporal columns inside each
   segment, drops rows where lateral control isn't steering (`lat_active`), streams CSV output, runs in parallel

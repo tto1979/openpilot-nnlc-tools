@@ -313,7 +313,7 @@ function load_data(infile::String, use_existing_data::Bool, outdir::String, out_
   return data
 end
 
-function train_model(working_dir::String, use_existing_model::Bool, data::DataFrame, out_streams; force_cpu::Bool=false)::NamedTuple{(:model, :input_mean, :input_std, :X_train, :y_train, :X_test, :y_test, :test_loss), Tuple{Flux.Chain, Matrix{Float32}, Matrix{Float32}, Matrix{Float32}, Vector{Float32}, Matrix{Float32}, Vector{Float32}, Float32}}
+function train_model(working_dir::String, use_existing_model::Bool, data::DataFrame, out_streams; force_cpu::Bool=false, adam::Bool=false, wide::Bool=false)::NamedTuple{(:model, :input_mean, :input_std, :X_train, :y_train, :X_test, :y_test, :test_loss), Tuple{Flux.Chain, Matrix{Float32}, Matrix{Float32}, Matrix{Float32}, Vector{Float32}, Matrix{Float32}, Vector{Float32}, Float32}}
   model_path = joinpath(working_dir, Base.basename(working_dir))
 
   # split into train and test sets
@@ -379,11 +379,15 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
 
   input_dim = size(X_train, 2)
 
-  # Define the model
+  # Define the model. --wide: 14 and 16 units in the hidden sigmoid layers instead of 7 and 13 (openpilot / sunnypilot
+  # load any layer sizes). On the Prius v data the small net, even fully trained, traded the steering-friction response
+  # near straight for the torque in gentle curves; the wider one fits both.
+  h1, h2 = wide ? (14, 16) : (7, 13)
+  println(out_streams, "Network: $(input_dim)-$(h1)-$(h2)-3-1")
   model = Chain(
-      Dense(input_dim, 7, sigmoid),
-      Dense(7, 13, sigmoid),
-      Dense(13, 3),
+      Dense(input_dim, h1, sigmoid),
+      Dense(h1, h2, sigmoid),
+      Dense(h2, 3),
       Dense(3, 1)
   ) |> device
 
@@ -558,7 +562,10 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
   # pick an optimizer
   # opt = Flux.ADAM(0.001)
   # opt = Flux.Nesterov()
-  opt = CustomAdaGrad(0.01f0, 1.0f-10)
+  # --adam: Adam with the learning rate decaying 3e-3 -> 3e-4 over the run. Full-batch AdaGrad's steps keep shrinking,
+  # so it stops short (Prius v: gentle curves 15-20% too much torque on its own training data; Adam: half that).
+  opt = adam ? Optimisers.Adam(3f-3) : CustomAdaGrad(0.01f0, 1.0f-10)
+  println(out_streams, adam ? "Optimizer: Adam, learning rate 3e-3 -> 3e-4" : "Optimizer: AdaGrad 0.01")
   state_tree = Optimisers.setup(opt, model)
 
   # train the model (with batches of shuffled data)
@@ -627,6 +634,9 @@ function train_model(working_dir::String, use_existing_model::Bool, data::DataFr
     epoch_last = 1
 
     while epoch < epoch_min || (epoch < epoch_max) # && (abs(Δloss) > tol || abs(ΔΔloss) > Δtol)
+        if adam
+          Optimisers.adjust!(state_tree, 3f-3 * 0.1f0^(Float32(epoch) / Float32(epoch_max)))
+        end
         # determine λ_monotonic and λ_odd. They stay at 0 until 25% of the way through the training, then increase linearly to their max values by 75% of the way through the training
         λ = λmax * min(1f0, max(0f0, epoch - epoch_max * λ_start_epoch_fraction) / (epoch_max * 0.7f0))
         λ_monotonic = λ_monotonicmax * min(1f0, max(0f0, epoch - epoch_max * λ_monotonic_start_epoch_fraction) / (epoch_max * 0.3f0))
@@ -1306,7 +1316,7 @@ function multiline_string(strings::Vector{String}, n::Int; prefix="")::String
   return join(lines, ",\n")
 end
 
-function create_model(in_file, out_dir_base; force_cpu::Bool=false)
+function create_model(in_file, out_dir_base; force_cpu::Bool=false, adam::Bool=false, wide::Bool=false)
   carname = replace(Base.basename(in_file), ".csv" => "")
   outdir = create_folder_with_iterator(out_dir_base, carname, make_new=true)
   logfile = open(outdir * "/$(carname)_log.txt", "a")  # Open log file in append mode
@@ -1329,19 +1339,19 @@ function create_model(in_file, out_dir_base; force_cpu::Bool=false)
       # return
   end
 
-  model, input_mean, input_std, X_train, y_train, X_test, y_test, test_loss = train_model(outdir, use_existing_input, data, out_streams; force_cpu=force_cpu)
+  model, input_mean, input_std, X_train, y_train, X_test, y_test, test_loss = train_model(outdir, use_existing_input, data, out_streams; force_cpu=force_cpu, adam=adam, wide=wide)
   
   test_plot_model(model, outdir, X_train, y_train, X_test, y_test, input_mean, input_std, multiline_string(names(select(data, Not([:torque_output]))), 60, prefix="Model input: "), out_streams, test_loss)
   close(logfile)
 end
 
-function main(in_dir; force_cpu::Bool=false)
+function main(in_dir; force_cpu::Bool=false, adam::Bool=false, wide::Bool=false)
   # A single CSV (as the README shows): train just that one. The model is named after the file, so name it after the
   # car fingerprint, e.g. TOYOTA_PRIUS_V.csv -> training_results/TOYOTA_PRIUS_V/TOYOTA_PRIUS_V.json
   if isfile(in_dir)
     results_dir = joinpath(dirname(abspath(in_dir)), "training_results")
     mkpath(results_dir)
-    create_model(abspath(in_dir), results_dir; force_cpu=force_cpu)
+    create_model(abspath(in_dir), results_dir; force_cpu=force_cpu, adam=adam, wide=wide)
     return
   end
   # A folder: train every CSV in it that isn't a balanced file
@@ -1353,12 +1363,14 @@ function main(in_dir; force_cpu::Bool=false)
   # Process each file
   for in_file in csv_files
       println("Processing $in_file")
-      create_model(joinpath(in_dir, in_file), results_dir; force_cpu=force_cpu)
+      create_model(joinpath(in_dir, in_file), results_dir; force_cpu=force_cpu, adam=adam, wide=wide)
   end
 end
 
 # Accept data directory as command-line argument, or default to ~/Downloads/rlogs/output/GENESIS
 force_cpu = "--cpu" in ARGS
+adam = "--adam" in ARGS
+wide = "--wide" in ARGS
 positional_args = filter(a -> !startswith(a, "--"), ARGS)
 
 if force_cpu
@@ -1366,8 +1378,8 @@ if force_cpu
 end
 
 if length(positional_args) > 0
-  main(positional_args[1]; force_cpu=force_cpu)
+  main(positional_args[1]; force_cpu=force_cpu, adam=adam, wide=wide)
 else
   home_dir = ENV["HOME"]
-  main("$home_dir/Downloads/rlogs/output/GENESIS"; force_cpu=force_cpu)
+  main("$home_dir/Downloads/rlogs/output/GENESIS"; force_cpu=force_cpu, adam=adam, wide=wide)
 end
